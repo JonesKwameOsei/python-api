@@ -1,0 +1,27 @@
+{{ .Chart.Name }} {{ .Values.image.tag | default .Chart.AppVersion }} is deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+{{- if .Values.autoscaling.enabled }}
+Replicas: autoscaled between {{ .Values.autoscaling.minReplicas }} and {{ .Values.autoscaling.maxReplicas }} (target CPU {{ .Values.autoscaling.targetCPUUtilizationPercentage }}%).
+{{- else }}
+Replicas: {{ .Values.replicaCount }}
+{{- end }}
+
+Check the pods:
+  kubectl -n {{ .Release.Namespace }} get pods -l app={{ include "python-app.name" . }}
+
+{{- if .Values.httpRoute.enabled }}
+{{- $host := first .Values.httpRoute.hostnames }}
+{{- $port := .Values.httpRoute.externalPort }}
+{{- $base := printf "http://%s%s" $host (ternary "" (printf ":%v" $port) (eq (toString $port) "80")) }}
+
+Check the route is attached to Gateway "{{ .Values.httpRoute.gateway.name }}" (expect Accepted=True):
+  kubectl -n {{ .Release.Namespace }} get httproute {{ include "python-app.name" . }} -o jsonpath='{.status.parents[0].conditions}'
+
+Call the API:
+  curl {{ $base }}/api/v1/details
+  curl {{ $base }}{{ .Values.healthCheckPath }}
+{{- else }}
+
+The HTTPRoute is disabled. Reach the API with a port-forward:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "python-app.name" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/api/v1/details
+{{- end }}

@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: test-com-tls
+  namespace: default          # must match the Gateway's namespace
+spec:
+  secretName: test-com-tls
+  dnsNames:
+    - "*.test.com"            # covers python-app.test.com, argocd.test.com, and future apps
+  issuerRef:
+    name: local-ca
+    kind: ClusterIssuer
