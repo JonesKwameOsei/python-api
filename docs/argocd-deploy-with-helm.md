@@ -100,7 +100,7 @@ Only a Gateway-API spec goes here: `gatewayClassName`, `listeners`, `addresses`,
 
 ## 4. The Argo CD values file
 
-[charts/python-app/argocd/values-argo.yaml](charts/python-app/argocd/values-argo.yaml):
+[argocd/values-argo.yaml](argocd/values-argo.yaml):
 
 ```yaml
 redis-ha:
@@ -184,11 +184,11 @@ helm repo update
 
 # 4. Preview what will be created (optional but useful)
 helm template argocd argo/argo-cd -n argocd \
-  -f charts/python-app/argocd/values-argo.yaml | grep -A20 "kind: HTTPRoute"
+  -f argocd/values-argo.yaml | grep -A20 "kind: HTTPRoute"
 
 # 5. Install / upgrade
 helm upgrade --install argocd argo/argo-cd -n argocd \
-  -f charts/python-app/argocd/values-argo.yaml
+  -f argocd/values-argo.yaml
 ```
 
 `upgrade --install` installs if the release is missing and upgrades if it exists, so you can rerun the same command after every values change.
