@@ -102,6 +102,8 @@ kind: Application
 metadata:
   name: python-app
   namespace: argocd              # Applications always live in Argo CD's namespace
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io   # deleting the Application also deletes what it deployed
 spec:
   project: default
 
@@ -131,6 +133,7 @@ spec:
 | Field | Why |
 |---|---|
 | `metadata.namespace: argocd` | Argo CD only watches Applications in its own namespace. This is **not** where the app is deployed. |
+| `finalizers` | Makes `kubectl delete` of the Application **cascade**: Argo CD deletes the Deployment, Service, ConfigMap and HTTPRoute first, then the Application goes. Without it, only the Application is deleted and everything it deployed keeps running. See [troubleshooting](#kubectl-delete-left-the-apps-resources-running). |
 | `project: default` | Argo CD Projects restrict which repos and namespaces an app can use. `default` allows everything; fine for learning. |
 | `repoURL` | Use the **HTTPS** URL. The SSH URL (`git@github.com:...`) would need an SSH key registered in Argo CD. |
 | `targetRevision: main` | Branch, tag or commit to follow. |
@@ -310,6 +313,7 @@ git push
 | Pushed a change but nothing happens | Still within the 3-minute poll | `argocd app get python-app --refresh` |
 | `helm list` doesn't show python-app | Expected | Argo CD owns it; use `argocd app get` |
 | "Sync OK" but app `OutOfSync` + `Degraded`, pod `CreateContainerConfigError: configmap "python-app" not found` | A **partial sync** applied only the Deployment | Full sync; see [below](#partial-sync-only-the-deployment-was-applied) |
+| `kubectl delete -f argocd/python-app.yaml` succeeds but the Deployment, Service, ConfigMap and HTTPRoute keep running | Application had no `resources-finalizer.argocd.argoproj.io` | See [below](#kubectl-delete-left-the-apps-resources-running) |
 | `argocd app get ...` returns `PermissionDenied` | App name typo (e.g. `python-ap`). Argo CD answers PermissionDenied for apps that don't exist. | Check the name with `argocd app list` |
 | App `OutOfSync` and nothing happens | Auto-sync is off ("Auto sync is not enabled" in the UI) | Sync manually, or enable `automated` ([section 7](#7-turning-on-automated-sync)) |
 
@@ -401,6 +405,86 @@ The UI said **"Auto sync is not enabled."** Without `syncPolicy.automated`, Argo
 
 **Rule of thumb:** sync the whole app (top SYNC button with everything ticked, or the CLI without `--resource`). Keep per-resource sync for deliberately re-applying one object.
 
+### `kubectl delete` left the app's resources running
+
+**What it looked like:**
+
+```text
+$ kubectl delete -f argocd/python-app.yaml
+application.argoproj.io "python-app" deleted
+
+$ kubectl -n python get deploy,cm,svc,httproute
+deployment.apps/python-app   2/2     2            2           4h7m
+configmap/python-app         2      3h37m
+service/python-app           ClusterIP   10.43.21.56   <none>   5000/TCP   3h37m
+httproute.gateway.networking.k8s.io/python-app   ["python-app.test.com"]   3h37m
+```
+
+The Application disappeared from Argo CD, but the app kept running. Argo CD calls these leftover resources **orphaned**.
+
+**Why:** an Application isn't the Kubernetes *owner* of what it deploys. It's a record that says "keep this Git path applied to that namespace". Deleting it doesn't delete the deployed resources. The link that makes deletion cascade is a **finalizer** on the Application:
+
+```yaml
+metadata:
+  name: python-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+```
+
+A finalizer is a marker that tells Kubernetes "don't remove this object yet, a controller has cleanup to do first":
+
+| Application has the finalizer? | `kubectl delete` does |
+|---|---|
+| **No** | Deletes the Application straight away. Deployed resources are left running. |
+| **Yes** | Kubernetes marks the Application as deleting and waits. Argo CD deletes every resource the app deployed, removes the finalizer, and then the Application disappears. |
+
+**Why `argocd app delete` behaves differently:** the CLI and the UI's **Delete** button request a cascading delete and add the finalizer themselves. `kubectl` knows nothing about Argo CD, so it only follows the object's metadata.
+
+| How you delete | Application removed | Resources removed | Namespace removed |
+|---|---|---|---|
+| `kubectl delete`, no finalizer | Yes | **No** | No |
+| `kubectl delete`, with finalizer | Yes | Yes | No |
+| `argocd app delete` / UI Delete | Yes | Yes (cascading by default) | No |
+
+**Cleaning up the leftovers.** Each orphaned resource still has Argo CD's ownership annotation:
+
+```bash
+kubectl -n python get deploy python-app -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}'
+# python-app:apps/Deployment:python/python-app
+```
+
+*Option A (recommended): let Argo CD clean up.* Add the finalizer to [argocd/python-app.yaml](../argocd/python-app.yaml) as in [section 4](#4-the-application-manifest), then apply and delete again. Argo CD takes the resources back over because the tracking annotation matches the app name, and the finalizer makes the delete cascade.
+
+```bash
+kubectl apply -f argocd/python-app.yaml
+argocd app get python-app                       # lists Deployment, Service, ConfigMap, HTTPRoute again
+kubectl delete -f argocd/python-app.yaml
+kubectl -n python get deploy,cm,svc,httproute   # only configmap/kube-root-ca.crt left
+```
+
+Commit and push the finalizer too, so the copy in Git deletes cleanly next time.
+
+*Option B: delete them by hand.*
+
+```bash
+kubectl -n python delete deploy,svc,cm,httproute python-app
+```
+
+**The namespace stays.** Argo CD never deletes a namespace it created with `CreateNamespace=true`, even with the finalizer, because the namespace might hold things the app doesn't own. Remove it yourself if you want it gone:
+
+```bash
+kubectl delete namespace python
+```
+
+**Heads up: a finalizer can block deletion.** If Argo CD can't finish the cleanup (it's been uninstalled, or the destination cluster is unreachable), the Application stays stuck in `Terminating`. Fix the cause if you can. As a last resort, remove the finalizer by hand. This deletes the Application **without** cleaning up its resources:
+
+```bash
+kubectl -n argocd patch application python-app --type merge -p '{"metadata":{"finalizers":null}}'
+```
+
+So uninstall Argo CD only **after** deleting the Applications it manages.
+
 ---
 
 ## 10. Cheat sheet
@@ -424,9 +508,13 @@ argocd app history python-app
 
 # Delete the Application AND everything it deployed
 argocd app delete python-app
+kubectl delete -f argocd/python-app.yaml   # same result, but only because of the finalizer
+
+# The namespace is never deleted by Argo CD
+kubectl delete namespace python
 ```
 
-`argocd app delete` removes the deployed resources as well as the Application. Deleting the Application with `kubectl delete` only cascades if the Application has Argo CD's `resources-finalizer.argocd.argoproj.io` finalizer.
+`argocd app delete` always cascades. `kubectl delete` cascades only because the manifest has the `resources-finalizer.argocd.argoproj.io` finalizer. Without it, the resources are orphaned ([troubleshooting](#kubectl-delete-left-the-apps-resources-running)).
 
 ---
 
