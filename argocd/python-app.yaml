@@ -2,7 +2,9 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: python-app
-  namespace: argocd              # Applications always live in Argo CD's namespace
+  namespace: argocd 
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io             # Applications always live in Argo CD's namespace
 spec:
   project: default
 
