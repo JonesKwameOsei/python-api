@@ -131,23 +131,39 @@ Using `port: 443` on the listener (as most docs do) wouldn't match any Traefik e
 ## 5. Install cert-manager
 
 ```bash
-# CRDs first
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.4/cert-manager.crds.yaml
-
-# Then the controller
-helm repo add jetstack https://charts.jetstack.io
-helm repo update
-
-helm upgrade --install cert-manager jetstack/cert-manager \
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  --version v1.21.2 \
   --namespace cert-manager \
   --create-namespace \
-  --version v1.14.4 \
-  --set installCRDs=false
+  --set crds.enabled=true
 
-kubectl -n cert-manager get pods     # cert-manager, cainjector, webhook: all Running
+kubectl -n cert-manager get pods     # cert-manager, cainjector, webhook: all 1/1 Running
+helm list -n cert-manager            # chart cert-manager-v1.21.2
 ```
 
-> **Heads up:** v1.14.4 is from 2024. It's fine for this guide, because we write Certificates by hand. A newer version is needed if you later want cert-manager to read the Gateway and create Certificates for you (see [next steps](#16-next-steps)). Check what's current with `helm search repo jetstack/cert-manager --versions | head`.
+| Part | Why |
+|---|---|
+| `oci://quay.io/jetstack/charts/cert-manager` | The chart is pulled straight from the OCI registry, so no `helm repo add` is needed |
+| `--version v1.21.2` | Always pin the version, so a reinstall gives you the same thing |
+| `--set crds.enabled=true` | Helm installs and owns the CRDs, so they're upgraded with the chart. Nothing is installed separately with `kubectl apply`. |
+| `crds.keep` (defaults to `true`) | `helm uninstall` **leaves the CRDs in place**. Deleting a CRD deletes every Certificate and Issuer of that kind, so this protects them. |
+
+### Upgrading later
+
+Upgrade **only with Helm**, and pass your values explicitly:
+
+```bash
+helm upgrade cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  -n cert-manager \
+  --version <new-version> \
+  --set crds.enabled=true
+```
+
+- **Don't** `kubectl apply` the upstream `cert-manager.yaml` over a Helm install. It merges a second container into each Deployment, and the pods crash ([troubleshooting](#cert-manager-pods-12-and-crashloopbackoff-after-kubectl-apply)).
+- **Don't** use `--reuse-values` across big version jumps. Old chart defaults fail the new chart's schema ([troubleshooting](#helm-upgrade---reuse-values-values-dont-meet-the-specifications-of-the-schema)).
+- Read the [release notes](https://cert-manager.io/docs/releases/) before each upgrade. Some versions have breaking changes.
+
+> **History:** This cluster first ran v1.14.4, with the CRDs installed by `kubectl apply` and the controller installed by Helm. It was moved to v1.21.2 with a clean reinstall that kept the CA Secret ([steps](#clean-reinstall-of-cert-manager-at-a-new-version)). The CA fingerprint stayed the same, so the trust set up in [section 11](#11-trust-the-ca-on-your-machine) still works.
 
 ---
 
@@ -536,6 +552,144 @@ solvers:
 
 Fixing it would let the ClusterIssuer apply, but Let's Encrypt still can't issue certificates here ([section 2](#2-why-not-lets-encrypt)). That's why the issuer was replaced with the local CA.
 
+### cert-manager pods `1/2` and `CrashLoopBackOff` after `kubectl apply`
+
+Running `kubectl apply -f .../v1.8.2/cert-manager.yaml` over the Helm-installed v1.14.4 left pods like this:
+
+```text
+NAME                                       READY   STATUS             RESTARTS
+cert-manager-78d8dbc6b5-pw9c2              1/2     CrashLoopBackOff   6
+cert-manager-cainjector-777b59d66d-c8xqs   2/2     Running            0
+cert-manager-webhook-c589f6fd4-gnrhr       1/2     CrashLoopBackOff   6
+```
+
+The `1/2` is the clue: each pod now has **two containers**.
+
+```bash
+kubectl -n cert-manager get deploy -o custom-columns='NAME:.metadata.name,CONTAINERS:.spec.template.spec.containers[*].name,IMAGES:.spec.template.spec.containers[*].image'
+```
+
+| Deployment | Containers |
+|---|---|
+| cert-manager | `cert-manager` (v1.8.2) + `cert-manager-controller` (v1.14.4) |
+| cert-manager-webhook | `cert-manager` (v1.8.2) + `cert-manager-webhook` (v1.14.4) |
+| cert-manager-cainjector | `cert-manager` (v1.8.2) + `cert-manager-cainjector` (v1.14.4) |
+
+Why it happened:
+
+1. `kubectl apply` doesn't replace a Deployment's container list. It **merges** it, matching containers by **name**.
+2. In v1.8.2 the container is called `cert-manager`. In newer versions it's `cert-manager-controller`, `cert-manager-webhook` and so on. The names don't match, so kubectl **added** a second container instead of replacing the existing one.
+3. Both containers in each pod try to listen on the same ports (`:10250`, `:6080`, `:9402`). The second one can't get the port and crashes. cainjector shows `2/2` only because it doesn't bind a conflicting port; it's just as broken.
+4. The old pods keep running because the new rollout never becomes ready, so cert-manager seems to work for a while.
+
+It was also a downgrade (v1.14.4 → v1.8.2).
+
+**Fix (keep the current version):** roll back the pod templates, then let Helm re-apply the rest (webhook configs, RBAC, ConfigMap):
+
+```bash
+kubectl -n cert-manager rollout undo deployment/cert-manager
+kubectl -n cert-manager rollout undo deployment/cert-manager-webhook
+kubectl -n cert-manager rollout undo deployment/cert-manager-cainjector
+helm upgrade cert-manager jetstack/cert-manager -n cert-manager --version v1.14.4 --reuse-values
+```
+
+Or do a clean reinstall at a new version ([below](#clean-reinstall-of-cert-manager-at-a-new-version)).
+
+**Lesson:** install each component **one way** and stick to it. If Helm installed it, change it with `helm upgrade`, never `kubectl apply` of the upstream release YAML.
+
+### `helm upgrade --reuse-values`: values don't meet the specifications of the schema
+
+```text
+Error: UPGRADE FAILED: values don't meet the specifications of the schema(s) in the following chart(s):
+cert-manager:
+- at '/prometheus': validation failed
+  - at '/prometheus/servicemonitor': additional properties 'path', 'targetPort' not allowed
+  - at '/prometheus/podmonitor': additional properties 'path' not allowed
+```
+
+This came from `helm upgrade ... --version v1.21.2 --reuse-values` on a v1.14.4 release. `--reuse-values` carries over **every value from the old release, including the old chart's defaults**. Newer charts removed some of those keys and check values against a JSON schema, so they're rejected.
+
+| Option | When |
+|---|---|
+| Drop `--reuse-values` and pass only the values you set (`--set crds.enabled=true`, `-f values.yaml`) | Most upgrades |
+| `--reset-then-reuse-values` | Start from the new chart's defaults, then apply only the values *you* set before |
+| Uninstall and reinstall | Large version jumps, or a messy release ([next section](#clean-reinstall-of-cert-manager-at-a-new-version)) |
+
+Don't use `--reuse-values` across big version jumps.
+
+### Clean reinstall of cert-manager at a new version
+
+The steps for replacing the old install with v1.21.2. Before starting, note two things:
+
+- The old v1.14.4 install had its CRDs created by `kubectl apply`, so they had no Helm ownership labels. `helm install --set crds.enabled=true` fails with **"invalid ownership metadata"** while they exist, so they must be deleted.
+- **Deleting a CRD deletes every object of that kind:** the `local-root-ca` and `test-com-tls` Certificates and both ClusterIssuers. They're in Git, so they can be re-applied. The Secret `local-root-ca` holds the **CA private key**, though. If it's lost, cert-manager creates a new CA and you have to [trust it again](#11-trust-the-ca-on-your-machine). So back it up and **don't delete the `cert-manager` namespace**.
+
+Check how the CRDs were installed:
+
+```bash
+kubectl get crd -o custom-columns='NAME:.metadata.name,MANAGED-BY:.metadata.labels.app\.kubernetes\.io/managed-by' | grep cert-manager
+# <none> = not Helm
+```
+
+**1. Back up:**
+
+```bash
+mkdir -p ~/cm-backup
+kubectl -n cert-manager get secret local-root-ca -o yaml > ~/cm-backup/local-root-ca.yaml
+kubectl get certificates,issuers,clusterissuers -A -o yaml > ~/cm-backup/cm-resources.yaml
+```
+
+The backup contains the CA private key. Keep it out of the repo.
+
+**2. Uninstall the release and delete the CRDs:**
+
+```bash
+helm uninstall cert-manager -n cert-manager
+kubectl get crd -o name | grep cert-manager.io | xargs kubectl delete
+```
+
+**3. Check that nothing is left over:**
+
+```bash
+kubectl -n cert-manager get all                                                        # empty
+kubectl -n cert-manager get secret local-root-ca                                       # still exists
+kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration | grep cert-manager   # empty
+```
+
+If a cert-manager webhook configuration is still there, delete it. A stale webhook points at a Service that no longer exists, and that blocks creating Certificates and Issuers later.
+
+**4. Install the new version, with Helm managing the CRDs:**
+
+```bash
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  --version v1.21.2 \
+  --namespace cert-manager \
+  --create-namespace \
+  --set crds.enabled=true
+
+kubectl -n cert-manager get pods -w       # cert-manager, cainjector, webhook: 1/1 Running
+```
+
+The OCI chart doesn't need `helm repo add`. With `crds.enabled=true`, the chart also defaults to `crds.keep=true`, so a future `helm uninstall` **leaves the CRDs** (and your certificates) in place.
+
+**5. Re-create the issuers and certificates:**
+
+```bash
+kubectl apply -f deploy/clusterissuer.yaml
+kubectl apply -f deploy/certificate.yaml
+kubectl get clusterissuer               # local-ca, selfsigned: True
+kubectl get certificate -A              # local-root-ca, test-com-tls: True
+```
+
+The `local-root-ca` Secret still exists, so cert-manager should reuse it instead of creating a new CA. If the CA did change, restore it with `kubectl apply -f ~/cm-backup/local-root-ca.yaml`, then delete `test-com-tls` so it's re-issued by the restored CA. To check, compare the CA with the copy you trusted:
+
+```bash
+kubectl -n cert-manager get secret local-root-ca -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -fingerprint
+openssl x509 -in local-root-ca.crt -noout -fingerprint          # should match
+```
+
+From now on, upgrade with `helm upgrade cert-manager oci://quay.io/jetstack/charts/cert-manager -n cert-manager --version <new> --set crds.enabled=true`.
+
 ### What was wrong in the first draft of this guide
 
 The original version of this file was copied from a generic example. Each of these settings would have broken this cluster:
@@ -569,6 +723,10 @@ The original version of this file was copied from a generic example. Each of the
 | Argo CD 404 on `http://...:8081` | Route is on `https` only | Expected; use `https://...:8443` |
 | `argocd login` fails with a TLS error | Still using `--plaintext`, or port 8081 | `argocd.test.com:8443 --grpc-web` (plus `--insecure` if the CA isn't trusted) |
 | Route `Accepted: False`, `NotAllowedByListeners` | Namespace missing the `gateway-access=true` label | `kubectl label namespace <ns> gateway-access=true` |
+| cert-manager pods `1/2`, `CrashLoopBackOff` | `kubectl apply` of release YAML merged a second container into the Helm Deployments | [Mixed install](#cert-manager-pods-12-and-crashloopbackoff-after-kubectl-apply) |
+| `helm upgrade`: values don't meet the specifications of the schema | `--reuse-values` carried old chart defaults into a newer chart | [Drop `--reuse-values`](#helm-upgrade---reuse-values-values-dont-meet-the-specifications-of-the-schema) |
+| `helm install`: invalid ownership metadata on a CRD | CRDs installed with `kubectl apply`, not Helm | [Clean reinstall](#clean-reinstall-of-cert-manager-at-a-new-version) |
+| Creating a Certificate fails: `failed calling webhook "webhook.cert-manager.io"` | Webhook configuration left behind, or webhook pod not ready | `kubectl -n cert-manager get pods`; delete stale webhook configurations |
 
 Useful detail commands:
 
@@ -614,6 +772,6 @@ kubectl -n default delete secret test-com-tls
 ## 16. Next steps
 
 - **Redirect HTTP to HTTPS:** a redirect HTTPRoute on the `http` listener, plus a `sectionName` value in the python-app chart so its route attaches only to `https`.
-- **Upgrade cert-manager:** recent versions can watch the Gateway itself. Annotate it with `cert-manager.io/cluster-issuer: local-ca`, enable Gateway API support in cert-manager, and it creates the Certificate from the listener's `hostname` and `certificateRefs`, so you don't need `certificate.yaml`.
+- **Let cert-manager read the Gateway:** v1.21.2 can watch Gateways itself. Enable Gateway API support in cert-manager and annotate the Gateway with `cert-manager.io/cluster-issuer: local-ca`. cert-manager then creates the Certificate from the listener's `hostname` and `certificateRefs`, so you don't need `certificate.yaml`.
 - **Manage this with Argo CD:** put `deploy/clusterissuer.yaml`, `certificate.yaml` and `gateway.yaml` under an Argo CD Application so the platform layer is GitOps too.
 - **Real domain:** on a public cluster, add a Let's Encrypt ClusterIssuer (HTTP-01 via `gatewayHTTPRoute.parentRefs`, or DNS-01 for wildcards) and point `issuerRef` at it.
