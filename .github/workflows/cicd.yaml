@@ -45,10 +45,22 @@ jobs:
     needs: ci
     runs-on: self-hosted
     steps:
+      - name: Install argocd CLI
+        shell: bash
+        run: |
+          mkdir -p "$HOME/bin"
+          VERSION=$(curl -s http://argocd-server.argocd/api/version | grep -o '"Version":"v[0-9.]*' | cut -d'"' -f4)
+          if [ -z "$VERSION" ]; then echo "Could not get ArgoCD server version"; exit 1; fi
+          curl -fksSL -o "$HOME/bin/argocd" \
+            "https://github.com/argoproj/argo-cd/releases/download/${VERSION}/argocd-linux-amd64"
+          chmod +x "$HOME/bin/argocd"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/argocd" version --client
+
       - name: Argocd app sync
         shell: bash
         run: |
-          argocd login argocd-server.argocd \
+          argocd login argocd-server.argocd:80 \
             --plaintext \
             --grpc-web \
             --username ${{ vars.ARGOCD_USERNAME }} \
