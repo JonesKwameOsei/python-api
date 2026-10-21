@@ -7,16 +7,17 @@ app = Flask(__name__)
 
 api = Api(app)
 
-class ReturnDetails(Resource):
+class ReturnInfo(Resource):
     def get(self):
         data = {
             "time": datetime.datetime.now().strftime("%I:%M:%S%p on %B %d, %Y"),
             "hostname": socket.gethostname(),
-            "message": "You are welcome to the python-app!"
+            "message": "You are welcome to the python-app! <3",
+            "deployed_on": "kubernetes"
         }
         return data
 
-api.add_resource(ReturnDetails, '/api/v1/details')
+api.add_resource(ReturnInfo, '/api/v1/info')
 
 class ReturnHealth(Resource):
     def get(self):
