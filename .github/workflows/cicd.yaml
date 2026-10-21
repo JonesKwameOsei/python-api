@@ -41,20 +41,51 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
   cd:
     needs: ci
     runs-on: self-hosted
+    permissions:
+      contents: write
     steps:
-      - name: Install argocd CLI
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yq
         shell: bash
         run: |
           mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/yq" \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod +x "$HOME/bin/yq"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/yq" --version
+
+      - name: Update appVersion in Chart.yaml
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          echo "New appVersion: $SHORT_SHA"
+          yq -i ".appVersion = \"$SHORT_SHA\" | .appVersion style=\"double\"" charts/python-app/Chart.yaml
+          cat charts/python-app/Chart.yaml
+
+      - name: Commit and push chart change
+        uses: EndBug/add-and-commit@v10
+        with:
+          add: charts/python-app/Chart.yaml
+          message: "chore: bump python-app appVersion to ${{ env.SHORT_SHA }}"
+          default_author: github_actions
+          pull: "--rebase --autostash"
+
+      - name: Install argocd CLI
+        shell: bash
+        run: |
           VERSION=$(curl -s http://argocd-server.argocd/api/version | grep -o '"Version":"v[0-9.]*' | cut -d'"' -f4)
           if [ -z "$VERSION" ]; then echo "Could not get ArgoCD server version"; exit 1; fi
-          curl -fksSL -o "$HOME/bin/argocd" \
+          curl -fsSL -o "$HOME/bin/argocd" \
             "https://github.com/argoproj/argo-cd/releases/download/${VERSION}/argocd-linux-amd64"
           chmod +x "$HOME/bin/argocd"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/argocd" version --client
 
       - name: Argocd app sync
