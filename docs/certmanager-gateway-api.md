@@ -355,7 +355,7 @@ server:
 
 ```bash
 helm upgrade --install argocd argo/argo-cd -n argocd \
-  -f charts/python-app/argocd/values-argo.yaml
+  -f argocd/values-argo.yaml
 
 kubectl -n argocd get httproute argocd-server -o jsonpath='{.spec.parentRefs[*].sectionName}'   # https
 ```
@@ -430,7 +430,7 @@ The file lives inside WSL, so open it from Windows through the WSL network path:
 
 1. Press **Win + R**, paste this and press Enter:
    ```text
-   \\wsl.localhost\Debian\home\jones\platform\devops\python-api
+   "\\wsl.localhost\Debian\home\jones\platform\from-devops-to-platform-engineer\devops\python-api"
    ```
    File Explorer opens your project folder.
 2. Double-click **local-root-ca.crt**, then click **Install Certificate...**.
