@@ -3,4 +3,4 @@ name: python-app
 description: Flask API (python-app) deployed behind the Traefik Gateway
 type: application
 version: 0.1.0
-appVersion: "052a59d"
+appVersion: "de7600c"
