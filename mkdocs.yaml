@@ -1,0 +1,21 @@
+site_name: Python-app
+site_description: Main documentation for python-app
+repo_url: https://github.com/JonesKwameOsei/python-api
+edit_uri: edit/main/docs
+
+plugins:
+  - techdocs-core
+
+
+# For sidebar navigation on https://backstage.io/, see `microsite/sidebars.js`
+
+nav:
+  - Overview:
+    - Getting started: docs/index.md
+  - Guides:
+      - Service Explained: guides/service-explanation.md
+      - K8s Manifests to Helm: guides/k8s-manifest-to-helm.md
+      - Ingress to Gateway API: guides/ingress-to-gateway.md
+      - cert-manager + Gateway API: guides/certmanager-gateway-api.md
+      - Argo CD Deploy: guides/argocd-deploy-python-app.md
+      - Argo CD with Helm: guides/argocd-deploy-with-helm.md
